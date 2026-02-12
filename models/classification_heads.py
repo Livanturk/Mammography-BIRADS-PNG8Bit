@@ -122,7 +122,7 @@ class HierarchicalClassifier(nn.Module):
             dropout=dropout,
         )
 
-        # Benign subgroup head: BIRADS 1 vs BIRADS 2
+        # Benign subgroup head: BI-RADS 1 vs BI-RADS 2
         self.benign_sub_head = ClassificationHead(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
