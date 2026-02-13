@@ -231,23 +231,22 @@ def scan_dataset_from_folders(root_dir: str) -> Tuple[List[str], List[int]]:
 
 def prepare_patient_split(
     root_dir: str,
-    train_ratio: float = 0.70,
+    test_dir: str,
+    train_ratio: float = 0.85,
     val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
     seed: int = 42,
 ) -> Dict[str, Tuple[List[str], List[int]]]:
     """
-    Hasta bazlı stratified train/val/test split uygular.
+    Hasta bazlı stratified train/val split uygular, test seti ayrı klasörden okunur.
 
-    Klasör yapısından etiketleri otomatik olarak okur.
-    Stratified split, her bölümde sınıf dağılımının yaklaşık olarak
-    korunmasını sağlar. Bu, dengesiz veri setlerinde özellikle önemlidir.
+    Train ve val, root_dir içindeki veriden stratified split ile ayrılır.
+    Test seti ise test_dir klasöründen bağımsız olarak yüklenir.
 
     Args:
-        root_dir: Veri setinin kök dizini (BI-RADS1/, BI-RADS2/, ... içeren).
-        train_ratio: Eğitim seti oranı.
-        val_ratio: Doğrulama seti oranı.
-        test_ratio: Test seti oranı.
+        root_dir: Train/Val veri setinin kök dizini (BI-RADS1/, BI-RADS2/, ... içeren).
+        test_dir: Sabit test seti kök dizini (aynı BI-RADS alt yapısı).
+        train_ratio: Eğitim seti oranı (root_dir içinden).
+        val_ratio: Doğrulama seti oranı (root_dir içinden).
         seed: Rastgelelik tohumu (tekrarlanabilirlik için).
 
     Returns:
@@ -258,42 +257,34 @@ def prepare_patient_split(
                 "test": ([dir1, dir2, ...], [label1, label2, ...]),
             }
     """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, (
-        "Bölme oranları toplamı 1.0 olmalıdır."
+    assert abs(train_ratio + val_ratio - 1.0) < 1e-6, (
+        "Train ve val oranları toplamı 1.0 olmalıdır."
     )
 
-    # Klasör yapısından hastaları ve etiketleri tara
+    # Train/Val: Klasör yapısından hastaları ve etiketleri tara
     patient_dirs, labels = scan_dataset_from_folders(root_dir)
-
     labels_arr = np.array(labels)
 
-    # İlk bölme: train vs (val + test)
-    val_test_ratio = val_ratio + test_ratio
-    train_dirs, valtest_dirs, train_labels, valtest_labels = train_test_split(
+    # Train vs Val bölme
+    train_dirs, val_dirs, train_labels, val_labels = train_test_split(
         patient_dirs, labels_arr,
-        test_size=val_test_ratio,
+        test_size=val_ratio,
         stratify=labels_arr,
         random_state=seed,
     )
 
-    # İkinci bölme: val vs test
-    relative_test_ratio = test_ratio / val_test_ratio
-    val_dirs, test_dirs, val_labels, test_labels = train_test_split(
-        valtest_dirs, valtest_labels,
-        test_size=relative_test_ratio,
-        stratify=valtest_labels,
-        random_state=seed,
-    )
+    # Test: Ayrı klasörden oku
+    test_dirs, test_labels = scan_dataset_from_folders(test_dir)
 
-    print(f"[BİLGİ] Veri bölme tamamlandı:")
-    print(f"  Train: {len(train_dirs)} hasta")
-    print(f"  Val:   {len(val_dirs)} hasta")
-    print(f"  Test:  {len(test_dirs)} hasta")
+    print(f"\n[BİLGİ] Veri bölme tamamlandı:")
+    print(f"  Train: {len(train_dirs)} hasta (kaynak: {root_dir})")
+    print(f"  Val:   {len(val_dirs)} hasta (kaynak: {root_dir})")
+    print(f"  Test:  {len(test_dirs)} hasta (kaynak: {test_dir})")
 
     return {
         "train": (train_dirs, train_labels.tolist()),
         "val": (val_dirs, val_labels.tolist()),
-        "test": (test_dirs, test_labels.tolist()),
+        "test": (test_dirs, test_labels),
     }
 
 
@@ -338,12 +329,12 @@ def create_dataloaders(
     data_cfg = config["data"]
     train_cfg = config["training"]
 
-    # Veri setini böl (klasör yapısından otomatik okuma)
+    # Veri setini böl (train/val root_dir'den, test ayrı test_dir'den)
     splits = prepare_patient_split(
         root_dir=data_cfg["root_dir"],
+        test_dir=data_cfg["test_dir"],
         train_ratio=data_cfg["split"]["train"],
         val_ratio=data_cfg["split"]["val"],
-        test_ratio=data_cfg["split"]["test"],
         seed=config["project"]["seed"],
     )
 
