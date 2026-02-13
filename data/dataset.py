@@ -122,10 +122,10 @@ class MammographyDataset(Dataset):
 # BI-RADS klasör adlarını 0-indexed sınıf indekslerine çevirme haritası
 # Klasör adı → sınıf indeksi
 BIRADS_FOLDER_TO_INDEX = {
-    "BI-RADS1": 0,
-    "BI-RADS2": 1,
-    "BI-RADS4": 2,
-    "BI-RADS5": 3,
+    "BI-RADS_1": 0,
+    "BI-RADS_2": 1,
+    "BI-RADS_4": 2,
+    "BI-RADS_5": 3,
 }
 
 # Sınıf indeksi → BI-RADS numarası (görselleştirme için)

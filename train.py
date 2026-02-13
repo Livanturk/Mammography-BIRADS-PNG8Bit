@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 from torch.cuda.amp import GradScaler, autocast
 import yaml
+from tqdm import tqdm
 
 from data.dataset import create_dataloaders
 from models.full_model import build_model, build_baseline_config
@@ -40,6 +41,7 @@ from models.gradcam import generate_gradcam_for_patient, save_gradcam_visualizat
 from utils.losses import build_loss_function
 from utils.metrics import MetricTracker
 from utils.mlflow_logger import ExperimentLogger
+from utils.wandb_logger import WandbLogger
 from utils.visualization import (
     plot_confusion_matrix,
     plot_training_curves,
@@ -202,7 +204,8 @@ def train_one_epoch(
     grad_accum = config["training"].get("gradient_accumulation_steps", 1)
     optimizer.zero_grad()
 
-    for step, batch in enumerate(dataloader):
+    pbar = tqdm(dataloader, desc="  Train", leave=False, ncols=100)
+    for step, batch in enumerate(pbar):
         images = batch["images"].to(device)     # (B, 4, 3, H, W)
         labels = batch["label"].to(device)       # (B,)
 
@@ -227,7 +230,9 @@ def train_one_epoch(
 
         # Metrikleri birikdir
         tracker.update(outputs, labels, loss_dict)
+        pbar.set_postfix(loss=f"{loss_dict['total_loss'].item():.4f}")
 
+    pbar.close()
     return tracker.compute()
 
 
@@ -243,7 +248,8 @@ def evaluate(
     model.eval()
     tracker.reset()
 
-    for batch in dataloader:
+    pbar = tqdm(dataloader, desc="  Val  ", leave=False, ncols=100)
+    for batch in pbar:
         images = batch["images"].to(device)
         labels = batch["label"].to(device)
 
@@ -251,7 +257,9 @@ def evaluate(
         loss_dict = criterion(outputs, labels)
 
         tracker.update(outputs, labels, loss_dict)
+        pbar.set_postfix(loss=f"{loss_dict['total_loss'].item():.4f}")
 
+    pbar.close()
     return tracker.compute()
 
 
@@ -277,7 +285,7 @@ def save_checkpoint(
     )
 
 
-def main(config_path: str, baseline: bool = False):
+def main(config_path: str, baseline: bool = False, device_id: int = 0):
     """Ana eğitim fonksiyonu."""
 
     # --- Konfigürasyon ---
@@ -291,10 +299,13 @@ def main(config_path: str, baseline: bool = False):
     set_seed(seed)
 
     # --- Cihaz ---
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available() and device_id >= 0:
+        device = torch.device(f"cuda:{device_id}")
+    else:
+        device = torch.device("cpu")
     print(f"[BİLGİ] Cihaz: {device}")
-    if torch.cuda.is_available():
-        print(f"[BİLGİ] GPU: {torch.cuda.get_device_name(0)}")
+    if device.type == "cuda":
+        print(f"[BİLGİ] GPU: {torch.cuda.get_device_name(device_id)}")
 
     # --- Veri ---
     print("\n[1/5] Veri yükleniyor...")
@@ -325,6 +336,11 @@ def main(config_path: str, baseline: bool = False):
     run_name = f"{'baseline' if baseline else 'full'}_{config['model']['backbone']['name']}"
     logger.start_run(run_name=run_name)
     logger.log_params_flat(config)
+
+    # --- WandB Logger ---
+    wandb_logger = WandbLogger(config)
+    wandb_logger.start_run(run_name=run_name)
+    wandb_logger.log_params_flat(config)
 
     # --- Eğitim Döngüsü ---
     print("\n[4/5] Eğitim başlıyor...")
@@ -370,6 +386,7 @@ def main(config_path: str, baseline: bool = False):
         log_metrics["epoch_time_s"] = epoch_time
 
         logger.log_metrics(log_metrics, step=epoch)
+        wandb_logger.log_metrics(log_metrics, step=epoch)
 
         # History'ye ekle
         for k, v in log_metrics.items():
@@ -415,7 +432,9 @@ def main(config_path: str, baseline: bool = False):
     )
 
     # Test metriklerini logla
-    logger.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
+    test_log = {f"test_{k}": v for k, v in test_metrics.items()}
+    logger.log_metrics(test_log)
+    wandb_logger.log_metrics(test_log)
 
     print("\n" + "=" * 60)
     print("TEST SONUÇLARI")
@@ -433,6 +452,7 @@ def main(config_path: str, baseline: bool = False):
     cm_path = os.path.join(vis_cfg.get("confusion_matrix", {}).get("save_dir", "outputs/plots"), "confusion_matrix.png")
     cm_fig = plot_confusion_matrix(cm, save_path=cm_path)
     logger.log_artifact(cm_path, "plots")
+    wandb_logger.log_artifact(cm_path, "plots")
 
     # Classification Report
     report = test_tracker.get_classification_report()
@@ -443,12 +463,14 @@ def main(config_path: str, baseline: bool = False):
         "Baseline": str(baseline),
     })
     logger.log_artifact(report_path, "reports")
+    wandb_logger.log_artifact(report_path, "reports")
     print(f"\n{report}")
 
     # Eğitim eğrileri
     curves_path = os.path.join(vis_cfg.get("confusion_matrix", {}).get("save_dir", "outputs/plots"), "training_curves.png")
     plot_training_curves(history, save_path=curves_path)
     logger.log_artifact(curves_path, "plots")
+    wandb_logger.log_artifact(curves_path, "plots")
 
     # Grad-CAM (opsiyonel)
     gradcam_cfg = vis_cfg.get("gradcam", {})
@@ -459,6 +481,9 @@ def main(config_path: str, baseline: bool = False):
 
         model.eval()
         test_loader = dataloaders["test"]
+        num_classes = config["model"]["classification"]["num_classes"]
+        samples_per_class = num_samples // num_classes
+        class_counts = {c: 0 for c in range(num_classes)}
         samples_done = 0
 
         for batch in test_loader:
@@ -477,6 +502,10 @@ def main(config_path: str, baseline: bool = False):
             for i in range(len(labels)):
                 if samples_done >= num_samples:
                     break
+
+                label_class = labels[i].item()
+                if class_counts[label_class] >= samples_per_class:
+                    continue
 
                 try:
                     heatmaps = generate_gradcam_for_patient(
@@ -499,6 +528,7 @@ def main(config_path: str, baseline: bool = False):
                         confidence=confidences[i].item(),
                         save_dir=gradcam_dir,
                     )
+                    class_counts[label_class] += 1
                     samples_done += 1
                 except Exception as e:
                     print(f"[UYARI] Grad-CAM hatası ({patient_ids[i]}): {e}")
@@ -507,9 +537,11 @@ def main(config_path: str, baseline: bool = False):
         if os.path.exists(gradcam_dir):
             for f in os.listdir(gradcam_dir):
                 logger.log_artifact(os.path.join(gradcam_dir, f), "gradcam")
+                wandb_logger.log_artifact(os.path.join(gradcam_dir, f), "gradcam")
 
     # Temizlik
     logger.end_run()
+    wandb_logger.end_run()
     print("\n[BİLGİ] Eğitim tamamlandı!")
 
 
@@ -528,6 +560,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Baseline deney (lateral/bilateral fusion kapalı)",
     )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=0,
+        help="Kullanılacak GPU indeksi (örn: 0, 1, 2, 3)",
+    )
 
     args = parser.parse_args()
-    main(config_path=args.config, baseline=args.baseline)
+    main(config_path=args.config, baseline=args.baseline, device_id=args.device)

@@ -18,11 +18,20 @@ Kullanım:
 """
 
 import os
+import ssl
+import urllib3
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mlflow
 import mlflow.pytorch
+
+# SSL doğrulamasını devre dışı bırak (kurumsal ağ kısıtlamaları için)
+os.environ["MLFLOW_TRACKING_INSECURE_TLS"] = "true"
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ssl._create_default_https_context = ssl._create_unverified_context
 
 
 class ExperimentLogger:
@@ -38,22 +47,32 @@ class ExperimentLogger:
         mlflow_cfg = config.get("mlflow", {})
 
         # DagsHub token ayarla (env variable veya config'den)
+        dagshub_username = mlflow_cfg.get("dagshub_username", "")
         dagshub_token = mlflow_cfg.get("dagshub_token", "")
         if dagshub_token:
-            os.environ["MLFLOW_TRACKING_USERNAME"] = "token"
+            os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_username or "token"
             os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
 
         # MLFlow tracking URI
         tracking_uri = mlflow_cfg.get(
             "tracking_uri", "mlruns"  # Varsayılan: yerel dizin
         )
-        mlflow.set_tracking_uri(tracking_uri)
 
         # Experiment oluştur veya seç
         experiment_name = mlflow_cfg.get(
             "experiment_name", "mammography-birads"
         )
-        mlflow.set_experiment(experiment_name)
+
+        # Uzak sunucuya bağlanamazsa lokal mlruns'a düş
+        try:
+            mlflow.set_tracking_uri(tracking_uri)
+            mlflow.set_experiment(experiment_name)
+            print(f"[MLFlow] Uzak sunucuya bağlandı: {tracking_uri}")
+        except Exception as e:
+            print(f"[MLFlow UYARI] Uzak sunucuya bağlanılamadı: {e}")
+            print("[MLFlow] Lokal mlruns dizinine geçiliyor...")
+            mlflow.set_tracking_uri("mlruns")
+            mlflow.set_experiment(experiment_name)
 
         self.run = None
 
