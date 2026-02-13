@@ -79,6 +79,7 @@ class MammographyClassifier(nn.Module):
             pretrained=backbone_cfg["pretrained"],
             projection_dim=self.projection_dim,
             freeze_layers=backbone_cfg.get("freeze_layers", 0),
+            projection_dropout=backbone_cfg.get("projection_dropout", 0.2),
         )
 
         # ============================================================
@@ -89,7 +90,9 @@ class MammographyClassifier(nn.Module):
             self.lateral_fusion = BilateralLateralFusion(
                 dim=self.projection_dim,
                 num_heads=lat_cfg["num_heads"],
-                dropout=lat_cfg["dropout"],
+                attention_dropout=lat_cfg.get("attention_dropout", 0.15),
+                ffn_dropout=lat_cfg.get("ffn_dropout", 0.2),
+                projection_dropout=lat_cfg.get("projection_dropout", 0.2),
                 num_layers=lat_cfg.get("num_layers", 2),
             )
         else:
@@ -108,7 +111,8 @@ class MammographyClassifier(nn.Module):
             self.bilateral_fusion = BilateralFusion(
                 dim=self.projection_dim,
                 num_heads=bil_cfg["num_heads"],
-                dropout=bil_cfg["dropout"],
+                attention_dropout=bil_cfg.get("attention_dropout", 0.2),
+                output_dropout=bil_cfg.get("output_dropout", 0.25),
                 use_diff=bil_cfg.get("use_diff", True),
                 use_avg=bil_cfg.get("use_avg", True),
             )

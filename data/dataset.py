@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 from data.transforms import get_train_transforms, get_val_transforms
@@ -288,32 +288,6 @@ def prepare_patient_split(
     }
 
 
-def get_weighted_sampler(labels: List[int]) -> WeightedRandomSampler:
-    """
-    Sınıf dengesizliğini gidermek için ağırlıklı örnekleyici oluşturur.
-
-    Az temsil edilen sınıfların daha sık örneklenmesini sağlar.
-    Her örneğin ağırlığı = 1 / (o sınıftaki toplam örnek sayısı).
-
-    Args:
-        labels: Veri setindeki etiketler listesi.
-
-    Returns:
-        WeightedRandomSampler: DataLoader'a geçirilecek örnekleyici.
-    """
-    class_counts = np.bincount(labels)
-    # Her sınıfın ağırlığı: toplam_örnek / sınıf_örnek_sayısı
-    class_weights = 1.0 / class_counts
-    sample_weights = [class_weights[label] for label in labels]
-    sample_weights = torch.tensor(sample_weights, dtype=torch.float64)
-
-    return WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
-
-
 def create_dataloaders(
     config: dict,
 ) -> Dict[str, DataLoader]:
@@ -359,15 +333,16 @@ def create_dataloaders(
         transform=val_transform,
     )
 
-    # Ağırlıklı örnekleyici (sadece eğitim seti için)
-    train_sampler = get_weighted_sampler(splits["train"][1])
-
     # DataLoader'lar
+    # Not: WeightedRandomSampler kaldırıldı. Sınıf dengesizliği yalnızca
+    # loss fonksiyonundaki class weights ile ele alınır (sqrt-inverse frequency).
+    # Sampler + class weights birlikte kullanıldığında çarpımsal aşırı telafi
+    # oluşuyor ve az örnekli sınıfların ezberlenmesine yol açıyordu.
     dataloaders = {
         "train": DataLoader(
             train_dataset,
             batch_size=train_cfg["batch_size"],
-            sampler=train_sampler,
+            shuffle=True,
             num_workers=data_cfg["num_workers"],
             pin_memory=data_cfg["pin_memory"],
             drop_last=True,

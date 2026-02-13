@@ -43,10 +43,17 @@ class CrossAttentionBlock(nn.Module):
     Args:
         dim: Öznitelik boyutu.
         num_heads: Dikkat başlığı sayısı (dim'in tam böleni olmalı).
-        dropout: Dropout oranı.
+        attention_dropout: Attention weight dropout oranı.
+        ffn_dropout: Feed-forward network dropout oranı.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        attention_dropout: float = 0.15,
+        ffn_dropout: float = 0.2,
+    ):
         super().__init__()
 
         assert dim % num_heads == 0, (
@@ -58,7 +65,7 @@ class CrossAttentionBlock(nn.Module):
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            dropout=dropout,
+            dropout=attention_dropout,
             batch_first=True,
         )
 
@@ -70,9 +77,9 @@ class CrossAttentionBlock(nn.Module):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4),    # Genişletme (4x standart)
             nn.GELU(),                   # Aktivasyon
-            nn.Dropout(dropout),
+            nn.Dropout(ffn_dropout),
             nn.Linear(dim * 4, dim),    # Geri daraltma
-            nn.Dropout(dropout),
+            nn.Dropout(ffn_dropout),
         )
 
     def forward(
@@ -136,18 +143,20 @@ class LateralFusion(nn.Module):
         self,
         dim: int,
         num_heads: int = 8,
-        dropout: float = 0.1,
+        attention_dropout: float = 0.15,
+        ffn_dropout: float = 0.2,
+        projection_dropout: float = 0.2,
         num_layers: int = 2,
     ):
         super().__init__()
 
         # Birden fazla cross-attention katmanı: bilgi derinleşir
         self.cc_to_mlo_layers = nn.ModuleList([
-            CrossAttentionBlock(dim, num_heads, dropout)
+            CrossAttentionBlock(dim, num_heads, attention_dropout, ffn_dropout)
             for _ in range(num_layers)
         ])
         self.mlo_to_cc_layers = nn.ModuleList([
-            CrossAttentionBlock(dim, num_heads, dropout)
+            CrossAttentionBlock(dim, num_heads, attention_dropout, ffn_dropout)
             for _ in range(num_layers)
         ])
 
@@ -156,7 +165,7 @@ class LateralFusion(nn.Module):
             nn.Linear(dim * 2, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(projection_dropout),
         )
 
     def forward(
@@ -214,7 +223,9 @@ class BilateralLateralFusion(nn.Module):
         self,
         dim: int,
         num_heads: int = 8,
-        dropout: float = 0.1,
+        attention_dropout: float = 0.15,
+        ffn_dropout: float = 0.2,
+        projection_dropout: float = 0.2,
         num_layers: int = 2,
     ):
         super().__init__()
@@ -223,7 +234,9 @@ class BilateralLateralFusion(nn.Module):
         self.lateral_fusion = LateralFusion(
             dim=dim,
             num_heads=num_heads,
-            dropout=dropout,
+            attention_dropout=attention_dropout,
+            ffn_dropout=ffn_dropout,
+            projection_dropout=projection_dropout,
             num_layers=num_layers,
         )
 

@@ -6,16 +6,21 @@ Eğitim ve doğrulama/test için görüntü dönüşüm pipeline'ları.
 Mamografi görüntüleri için özel dikkat edilmesi gerekenler:
 - Dikey çevirme genelde yapılmaz (anatomik yönelimi bozar).
 - Aşırı renk/kontrast değişikliği diagnostik bilgiyi bozabilir.
-- Normalize değerleri ImageNet istatistiklerine göre ayarlanır
-  (pretrained backbone kullandığımız için).
+- Grayscale görüntüler 3 kanala kopyalandığı için, 3 kanala da aynı
+  normalizasyon değeri uygulanmalıdır. ImageNet'in grayscale karşılığı
+  (luminance formula: 0.299R + 0.587G + 0.114B) kullanılır.
 """
 
 from torchvision import transforms
 
 
-# ImageNet normalizasyon değerleri (pretrained modeller için standart)
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+# Grayscale-uyumlu ImageNet normalizasyon değerleri
+# Grayscale→RGB kopyalama yapıldığı için 3 kanal identik olmalı.
+# Değerler ImageNet luminance ortalamasından türetilmiştir:
+#   mean = 0.299*0.485 + 0.587*0.456 + 0.114*0.406 ≈ 0.449
+#   std  = sqrt(0.299*0.229² + 0.587*0.224² + 0.114*0.225²) ≈ 0.226
+IMAGENET_MEAN = [0.449, 0.449, 0.449]
+IMAGENET_STD = [0.226, 0.226, 0.226]
 
 
 def get_train_transforms(data_cfg: dict) -> transforms.Compose:

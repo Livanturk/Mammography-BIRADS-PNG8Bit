@@ -53,7 +53,8 @@ class BilateralFusion(nn.Module):
         self,
         dim: int,
         num_heads: int = 8,
-        dropout: float = 0.1,
+        attention_dropout: float = 0.2,
+        output_dropout: float = 0.25,
         use_diff: bool = True,
         use_avg: bool = True,
     ):
@@ -70,7 +71,7 @@ class BilateralFusion(nn.Module):
             d_model=dim,
             nhead=num_heads,
             dim_feedforward=dim * 4,
-            dropout=dropout,
+            dropout=attention_dropout,
             activation="gelu",
             batch_first=True,       # (B, seq_len, dim) formatı
             norm_first=True,        # Pre-LN (daha stabil eğitim)
@@ -91,12 +92,13 @@ class BilateralFusion(nn.Module):
             nn.Linear(dim // 4, 1),     # Her token için skaler skor
         )
 
-        # Son projeksiyon
+        # Son projeksiyon — sınıflandırma öncesi son darboğaz, daha yüksek
+        # dropout ile modelin sadece en discriminative feature'ları taşımasını zorlar
         self.output_projection = nn.Sequential(
             nn.Linear(dim, dim),
             nn.LayerNorm(dim),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(output_dropout),
         )
 
     def forward(

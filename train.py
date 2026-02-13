@@ -66,31 +66,162 @@ def load_config(config_path: str) -> dict:
     return config
 
 
+def _get_param_groups(model: nn.Module, config: dict) -> list:
+    """
+    Layer-wise weight decay ve discriminative learning rate ile
+    parametre grupları oluşturur.
+
+    Prensipler:
+    - Backbone (pretrained): Düşük LR + yüksek WD → orijinalden uzaklaşmayı sınırla
+    - Fusion katmanları: Normal LR + orta WD → domain-specific öğrenme
+    - Classification heads: Normal LR + düşük WD → dropout zaten regularize ediyor
+    - LayerNorm/Bias: WD=0 → scale/shift parametrelerine decay uygulanmamalı
+    """
+    opt_cfg = config["training"]["optimizer"]
+    base_lr = opt_cfg["lr"]
+    backbone_lr = base_lr * opt_cfg.get("backbone_lr_scale", 0.1)
+
+    # Weight decay değerleri (geriye uyumluluk: eski config tek float olabilir)
+    wd_cfg = opt_cfg["weight_decay"]
+    if isinstance(wd_cfg, (int, float)):
+        wd_backbone = float(wd_cfg)
+        wd_fusion = float(wd_cfg)
+        wd_head = float(wd_cfg)
+    else:
+        wd_backbone = wd_cfg.get("backbone", 0.1)
+        wd_fusion = wd_cfg.get("fusion", 0.05)
+        wd_head = wd_cfg.get("head", 0.01)
+
+    # Parametre kategorileri
+    backbone_decay = []
+    backbone_no_decay = []
+    fusion_decay = []
+    fusion_no_decay = []
+    head_decay = []
+    head_no_decay = []
+
+    # LayerNorm ve bias parametrelerini ayırt etme fonksiyonu
+    no_decay_keywords = {"bias", "LayerNorm", "layernorm", "layer_norm",
+                         "norm", "ln", "log_temperature"}
+
+    def is_no_decay(name):
+        return any(kw in name for kw in no_decay_keywords)
+
+    for param_name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Backbone parametreleri
+        if param_name.startswith("backbone.backbone.backbone"):
+            if is_no_decay(param_name):
+                backbone_no_decay.append(param)
+            else:
+                backbone_decay.append(param)
+        # Backbone projection
+        elif param_name.startswith("backbone.backbone.projection"):
+            if is_no_decay(param_name):
+                fusion_no_decay.append(param)
+            else:
+                fusion_decay.append(param)
+        # Fusion katmanları (lateral + bilateral)
+        elif "lateral_fusion" in param_name or "bilateral_fusion" in param_name:
+            if is_no_decay(param_name):
+                fusion_no_decay.append(param)
+            else:
+                fusion_decay.append(param)
+        # Basit projection (baseline mod)
+        elif "simple_lateral_proj" in param_name or "simple_bilateral_proj" in param_name:
+            if is_no_decay(param_name):
+                fusion_no_decay.append(param)
+            else:
+                fusion_decay.append(param)
+        # Classification heads
+        elif "classifier" in param_name:
+            if is_no_decay(param_name):
+                head_no_decay.append(param)
+            else:
+                head_decay.append(param)
+        else:
+            # Bilinmeyen parametreler → fusion grubuna ata
+            if is_no_decay(param_name):
+                fusion_no_decay.append(param)
+            else:
+                fusion_decay.append(param)
+
+    param_groups = []
+    if backbone_decay:
+        param_groups.append({
+            "params": backbone_decay,
+            "lr": backbone_lr,
+            "weight_decay": wd_backbone,
+            "group_name": "backbone_decay",
+        })
+    if backbone_no_decay:
+        param_groups.append({
+            "params": backbone_no_decay,
+            "lr": backbone_lr,
+            "weight_decay": 0.0,
+            "group_name": "backbone_no_decay",
+        })
+    if fusion_decay:
+        param_groups.append({
+            "params": fusion_decay,
+            "lr": base_lr,
+            "weight_decay": wd_fusion,
+            "group_name": "fusion_decay",
+        })
+    if fusion_no_decay:
+        param_groups.append({
+            "params": fusion_no_decay,
+            "lr": base_lr,
+            "weight_decay": 0.0,
+            "group_name": "fusion_no_decay",
+        })
+    if head_decay:
+        param_groups.append({
+            "params": head_decay,
+            "lr": base_lr,
+            "weight_decay": wd_head,
+            "group_name": "head_decay",
+        })
+    if head_no_decay:
+        param_groups.append({
+            "params": head_no_decay,
+            "lr": base_lr,
+            "weight_decay": 0.0,
+            "group_name": "head_no_decay",
+        })
+
+    # Özet yazdır
+    total = sum(p.numel() for g in param_groups for p in g["params"])
+    print(f"\n[OPTİMİZER] Layer-wise parametre grupları:")
+    for g in param_groups:
+        count = sum(p.numel() for p in g["params"])
+        print(f"  {g['group_name']:25s}: {count:>10,} params | lr={g['lr']:.2e} | wd={g['weight_decay']:.3f}")
+    print(f"  {'TOPLAM':25s}: {total:>10,} params")
+
+    return param_groups
+
+
 def build_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
-    """Config'e göre optimizer oluşturur."""
+    """Config'e göre layer-wise weight decay ile optimizer oluşturur."""
     opt_cfg = config["training"]["optimizer"]
     name = opt_cfg["name"].lower()
 
-    params = filter(lambda p: p.requires_grad, model.parameters())
+    param_groups = _get_param_groups(model, config)
 
     if name == "adamw":
         return torch.optim.AdamW(
-            params,
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg["weight_decay"],
+            param_groups,
             betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
         )
     elif name == "adam":
         return torch.optim.Adam(
-            params,
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg["weight_decay"],
+            param_groups,
         )
     elif name == "sgd":
         return torch.optim.SGD(
-            params,
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg["weight_decay"],
+            param_groups,
             momentum=0.9,
             nesterov=True,
         )

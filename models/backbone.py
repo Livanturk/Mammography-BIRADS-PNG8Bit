@@ -42,6 +42,7 @@ class BackboneFeatureExtractor(nn.Module):
         pretrained: bool = True,
         projection_dim: int = 512,
         freeze_layers: int = 0,
+        projection_dropout: float = 0.2,
     ):
         super().__init__()
 
@@ -63,7 +64,7 @@ class BackboneFeatureExtractor(nn.Module):
             nn.Linear(backbone_dim, projection_dim),
             nn.LayerNorm(projection_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(projection_dropout),
         )
 
         # İsteğe bağlı: İlk katmanları dondur
@@ -146,6 +147,7 @@ class MultiViewBackbone(nn.Module):
         pretrained: bool = True,
         projection_dim: int = 512,
         freeze_layers: int = 0,
+        projection_dropout: float = 0.2,
     ):
         super().__init__()
 
@@ -155,6 +157,7 @@ class MultiViewBackbone(nn.Module):
             pretrained=pretrained,
             projection_dim=projection_dim,
             freeze_layers=freeze_layers,
+            projection_dropout=projection_dropout,
         )
 
     def forward(
