@@ -113,7 +113,10 @@ def plot_training_curves(
     """
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    epochs = range(1, len(history.get("train_loss", [1])) + 1)
+    # Determine epoch count from the first available history key
+    first_key = next(iter(history), None)
+    n_epochs = len(history[first_key]) if first_key else 1
+    epochs = range(1, n_epochs + 1)
 
     # 1. Loss grafiği
     ax = axes[0, 0]
