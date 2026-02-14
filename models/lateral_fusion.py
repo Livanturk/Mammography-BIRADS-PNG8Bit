@@ -1,26 +1,34 @@
 """
-Seviye 2: Lateral-Level Fusion (Bi-directional Cross-Attention)
-================================================================
-Aynı taraftaki CC ve MLO görüntülerini cross-attention ile birleştirir.
+Seviye 2: Lateral-Level Fusion (Spatial Cross-Attention)
+=========================================================
+Aynı taraftaki CC ve MLO görüntülerinin spatial öznitelik haritaları
+arasında cross-attention uygular.
 
-Neden Cross-Attention?
+Neden Spatial Cross-Attention?
     CC (üstten) ve MLO (yandan) görüntüleri aynı memeyi farklı açılardan gösterir.
-    Cross-attention, bir görüntüdeki bilginin diğer görüntüdeki ilgili bölgelere
-    "dikkat etmesini" sağlar. Örneğin, CC'de görülen bir kitle MLO'daki
-    karşılık gelen bölge ile eşleştirilir.
+    Radyolog CC'de gördüğü bir kitlenin MLO'daki karşılığını arar.
 
-    Bi-directional: Hem CC→MLO hem MLO→CC yönünde dikkat hesaplanır.
+    Spatial cross-attention bu süreci modeller:
+    CC'deki HER spatial bölge (token), MLO'daki TÜM spatial bölgelere
+    dikkat ederek en ilgili bölgeleri bulur. Bu sayede:
+    - CC'de bir kitle varsa, MLO'daki karşılık gelen bölge vurgulanır
+    - Multi-head yapı farklı ilişki türlerini paralel öğrenir
+    - Birden fazla katman ile bilgi giderek daha fazla paylaşılır
 
 Matematiksel Detay:
-    Cross-Attention(Q, K, V):
-        Q = CC feature, K = V = MLO feature (veya tam tersi)
-        Attention(Q, K, V) = softmax(QK^T / √d_k) × V
+    Spatial tokenlar: CC = (B, S, dim), MLO = (B, S, dim)
+    S = H × W (örn: 12×12 = 144 token, 384×384 girdi, stride=32)
 
-    Birleştirme:
-        CC_enhanced = CrossAttn(CC→MLO) + CC    (residual bağlantı)
-        MLO_enhanced = CrossAttn(MLO→CC) + MLO
+    Cross-Attention (Pre-LN):
+        Q = LayerNorm(CC),  K = V = LayerNorm(MLO)
+        CC' = CC + MultiHeadAttn(Q, K, V)    (residual)
+        CC'' = CC' + FFN(LayerNorm(CC'))       (residual)
 
-        Lateral_Feature = LayerNorm(CC_enhanced + MLO_enhanced)
+    Bi-directional: Hem CC→MLO hem MLO→CC yönünde.
+
+    Attention Pooling:
+        S adet spatial token → tek lateral vektör (dim boyutlu)
+        Her token için öğrenilen önem skoru hesaplanır.
 """
 
 import torch
@@ -29,16 +37,14 @@ import torch.nn as nn
 
 class CrossAttentionBlock(nn.Module):
     """
-    Tek yönlü Cross-Attention bloğu.
+    Pre-LN Spatial Cross-Attention bloğu.
 
-    Bir kaynak (source) özniteliğin, bir hedef (target) özniteliğe
-    dikkat etmesini sağlar.
+    Source dizisindeki her token, target dizisindeki tüm token'lara
+    dikkat eder. Pre-LN (norm-first) kullanılır — daha stabil eğitim sağlar.
 
-    Akış:
-        Query = Linear(source)
-        Key   = Linear(target)
-        Value = Linear(target)
-        Output = MultiHeadAttention(Q, K, V) + source  (residual)
+    Akış (Pre-LN):
+        h = source + MultiHeadAttn(LN(source), LN(target), LN(target))
+        output = h + FFN(LN(h))
 
     Args:
         dim: Öznitelik boyutu.
@@ -60,8 +66,7 @@ class CrossAttentionBlock(nn.Module):
             f"dim ({dim}), num_heads ({num_heads}) ile tam bölünmeli."
         )
 
-        # Multi-Head Attention: PyTorch'un yerleşik implementasyonu
-        # batch_first=True: Giriş boyutu (B, seq_len, dim) olur
+        # Multi-Head Cross-Attention
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=num_heads,
@@ -69,16 +74,17 @@ class CrossAttentionBlock(nn.Module):
             batch_first=True,
         )
 
-        # Layer normalization: Eğitimi stabilize eder
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        # Pre-LN: Normalizasyon attention/FFN ÖNCESİNDE uygulanır
+        self.norm_q = nn.LayerNorm(dim)      # Query (source) normalizasyonu
+        self.norm_kv = nn.LayerNorm(dim)     # Key/Value (target) normalizasyonu
+        self.norm_ffn = nn.LayerNorm(dim)    # FFN öncesi normalizasyon
 
-        # Feed-forward network (attention sonrası)
+        # Feed-forward network
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),    # Genişletme (4x standart)
-            nn.GELU(),                   # Aktivasyon
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
             nn.Dropout(ffn_dropout),
-            nn.Linear(dim * 4, dim),    # Geri daraltma
+            nn.Linear(dim * 4, dim),
             nn.Dropout(ffn_dropout),
         )
 
@@ -86,62 +92,61 @@ class CrossAttentionBlock(nn.Module):
         self, source: torch.Tensor, target: torch.Tensor
     ) -> torch.Tensor:
         """
-        Cross-attention uygular: source, target'a dikkat eder.
+        Spatial cross-attention uygular.
 
         Args:
-            source: (B, dim) — Sorgu (query) kaynağı.
-            target: (B, dim) — Anahtar ve değer kaynağı.
+            source: (B, S_q, dim) — Sorgu kaynağı (spatial token dizisi).
+            target: (B, S_kv, dim) — Anahtar/değer kaynağı (spatial token dizisi).
+                    Genelde S_q == S_kv (aynı backbone, aynı spatial boyut).
 
         Returns:
-            (B, dim) — Zenginleştirilmiş source özniteliği.
+            (B, S_q, dim) — Cross-attention ile zenginleştirilmiş source dizisi.
         """
-        # Vektörleri sequence formatına çevir: (B, dim) → (B, 1, dim)
-        # MultiheadAttention sequence boyutu bekler
-        src = source.unsqueeze(1)
-        tgt = target.unsqueeze(1)
+        # Pre-LN Cross-Attention
+        src_norm = self.norm_q(source)
+        tgt_norm = self.norm_kv(target)
 
-        # Cross-attention: source (Q), target (K, V)
-        # attn_output: (B, 1, dim)
         attn_output, _ = self.cross_attn(
-            query=src,
-            key=tgt,
-            value=tgt,
+            query=src_norm,
+            key=tgt_norm,
+            value=tgt_norm,
         )
+        source = source + attn_output       # Residual bağlantı
 
-        # Residual bağlantı + Layer Norm
-        src = self.norm1(src + attn_output)
+        # Pre-LN Feed-Forward
+        ffn_output = self.ffn(self.norm_ffn(source))
+        source = source + ffn_output        # Residual bağlantı
 
-        # Feed-forward + Residual + Layer Norm
-        ffn_output = self.ffn(src)
-        src = self.norm2(src + ffn_output)
-
-        # Sequence boyutunu kaldır: (B, 1, dim) → (B, dim)
-        return src.squeeze(1)
+        return source
 
 
 class LateralFusion(nn.Module):
     """
-    Bir taraftaki CC ve MLO görüntülerini bi-directional cross-attention
-    ile birleştirip tek bir lateral öznitelik vektörü üretir.
+    Bir taraftaki CC ve MLO spatial özniteliklerini bi-directional
+    cross-attention ile birleştirip tek bir lateral vektör üretir.
 
     Akış:
-        1. CC → CrossAttn → CC' (MLO bilgisi ile zenginleştirilmiş)
-        2. MLO → CrossAttn → MLO' (CC bilgisi ile zenginleştirilmiş)
-        3. Lateral = Projection(CC' + MLO')
-
-    Bu işlem N kez tekrarlanır (num_layers), böylece bilgi
-    iki görüntü arasında giderek daha fazla paylaşılır.
+        1. Positional embedding ekle (spatial konum bilgisi)
+        2. N katman bi-directional cross-attention:
+           CC' = CrossAttn(CC → MLO)   — CC, MLO'ya dikkat eder
+           MLO' = CrossAttn(MLO → CC)  — MLO, CC'ye dikkat eder
+        3. Attention pooling: spatial token'ları tek vektöre indirge
+        4. Fusion: concat([CC_pooled, MLO_pooled]) → projeksiyon
 
     Args:
         dim: Öznitelik boyutu.
+        num_spatial_tokens: Spatial token sayısı (H × W).
         num_heads: Cross-attention başlık sayısı.
-        dropout: Dropout oranı.
-        num_layers: Cross-attention katman sayısı (daha fazla = daha derin etkileşim).
+        attention_dropout: Attention dropout oranı.
+        ffn_dropout: FFN dropout oranı.
+        projection_dropout: Fusion projeksiyon dropout oranı.
+        num_layers: Cross-attention katman sayısı.
     """
 
     def __init__(
         self,
         dim: int,
+        num_spatial_tokens: int,
         num_heads: int = 8,
         attention_dropout: float = 0.15,
         ffn_dropout: float = 0.2,
@@ -150,7 +155,14 @@ class LateralFusion(nn.Module):
     ):
         super().__init__()
 
-        # Birden fazla cross-attention katmanı: bilgi derinleşir
+        # Learnable positional embedding — spatial konum bilgisi
+        # CC ve MLO aynı backbone'dan geçtiği için aynı spatial grid'e sahip,
+        # dolayısıyla aynı positional embedding paylaşılır
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, num_spatial_tokens, dim) * 0.02
+        )
+
+        # Bi-directional cross-attention katmanları
         self.cc_to_mlo_layers = nn.ModuleList([
             CrossAttentionBlock(dim, num_heads, attention_dropout, ffn_dropout)
             for _ in range(num_layers)
@@ -160,6 +172,17 @@ class LateralFusion(nn.Module):
             for _ in range(num_layers)
         ])
 
+        # Cross-attention sonrası normalizasyon
+        self.final_norm = nn.LayerNorm(dim)
+
+        # Attention pooling: spatial token'ları tek vektöre indirger
+        # Her token için öğrenilen önem skoru hesaplar
+        self.attention_pool = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.Tanh(),
+            nn.Linear(dim // 4, 1),
+        )
+
         # Son birleştirme projeksiyon katmanı
         self.fusion_projection = nn.Sequential(
             nn.Linear(dim * 2, dim),
@@ -168,35 +191,59 @@ class LateralFusion(nn.Module):
             nn.Dropout(projection_dropout),
         )
 
+    def _pool_spatial(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Attention pooling: spatial token dizisini tek vektöre indirger.
+
+        Args:
+            x: (B, S, dim) — Spatial token dizisi.
+
+        Returns:
+            (B, dim) — Ağırlıklı toplam ile elde edilen tek vektör.
+        """
+        scores = self.attention_pool(x)             # (B, S, 1)
+        weights = torch.softmax(scores, dim=1)      # (B, S, 1) — normalize
+        pooled = (weights * x).sum(dim=1)           # (B, dim)
+        return pooled
+
     def forward(
         self, cc_feat: torch.Tensor, mlo_feat: torch.Tensor
     ) -> torch.Tensor:
         """
-        CC ve MLO özniteliklerini birleştirir.
+        CC ve MLO spatial özniteliklerini cross-attention ile birleştirir.
 
         Args:
-            cc_feat:  (B, dim) — CC görüntüsünün öznitelik vektörü.
-            mlo_feat: (B, dim) — MLO görüntüsünün öznitelik vektörü.
+            cc_feat:  (B, S, dim) — CC görüntüsünün spatial öznitelik dizisi.
+            mlo_feat: (B, S, dim) — MLO görüntüsünün spatial öznitelik dizisi.
 
         Returns:
-            (B, dim) — Birleştirilmiş lateral öznitelik.
+            (B, dim) — Birleştirilmiş lateral öznitelik vektörü.
         """
-        cc_enhanced = cc_feat
-        mlo_enhanced = mlo_feat
+        # Positional embedding ekle — spatial konum bilgisi
+        cc_enhanced = cc_feat + self.pos_embed
+        mlo_enhanced = mlo_feat + self.pos_embed
 
-        # Her katmanda çift yönlü bilgi alışverişi
+        # Her katmanda çift yönlü spatial cross-attention
         for cc2mlo, mlo2cc in zip(self.cc_to_mlo_layers, self.mlo_to_cc_layers):
-            # CC, MLO'ya dikkat eder → CC zenginleşir
+            # CC'deki her token, MLO'daki tüm token'lara dikkat eder
             cc_new = cc2mlo(cc_enhanced, mlo_enhanced)
-            # MLO, CC'ye dikkat eder → MLO zenginleşir
+            # MLO'daki her token, CC'deki tüm token'lara dikkat eder
             mlo_new = mlo2cc(mlo_enhanced, cc_enhanced)
 
             cc_enhanced = cc_new
             mlo_enhanced = mlo_new
 
-        # İki zenginleştirilmiş vektörü birleştir
-        fused = torch.cat([cc_enhanced, mlo_enhanced], dim=-1)  # (B, dim*2)
-        lateral = self.fusion_projection(fused)                  # (B, dim)
+        # Final normalizasyon
+        cc_enhanced = self.final_norm(cc_enhanced)
+        mlo_enhanced = self.final_norm(mlo_enhanced)
+
+        # Attention pooling: (B, S, dim) → (B, dim)
+        cc_pooled = self._pool_spatial(cc_enhanced)
+        mlo_pooled = self._pool_spatial(mlo_enhanced)
+
+        # İki pooled vektörü birleştir ve projeksiyon uygula
+        fused = torch.cat([cc_pooled, mlo_pooled], dim=-1)   # (B, dim*2)
+        lateral = self.fusion_projection(fused)               # (B, dim)
 
         return lateral
 
@@ -214,14 +261,18 @@ class BilateralLateralFusion(nn.Module):
 
     Args:
         dim: Öznitelik boyutu.
+        num_spatial_tokens: Spatial token sayısı (H × W).
         num_heads: Cross-attention başlık sayısı.
-        dropout: Dropout oranı.
+        attention_dropout: Attention dropout oranı.
+        ffn_dropout: FFN dropout oranı.
+        projection_dropout: Fusion projeksiyon dropout oranı.
         num_layers: Cross-attention katman sayısı.
     """
 
     def __init__(
         self,
         dim: int,
+        num_spatial_tokens: int,
         num_heads: int = 8,
         attention_dropout: float = 0.15,
         ffn_dropout: float = 0.2,
@@ -233,6 +284,7 @@ class BilateralLateralFusion(nn.Module):
         # Weight-shared lateral fusion (sağ ve sol aynı ağırlıkları paylaşır)
         self.lateral_fusion = LateralFusion(
             dim=dim,
+            num_spatial_tokens=num_spatial_tokens,
             num_heads=num_heads,
             attention_dropout=attention_dropout,
             ffn_dropout=ffn_dropout,
@@ -243,12 +295,12 @@ class BilateralLateralFusion(nn.Module):
     def forward(self, view_features: dict) -> dict:
         """
         Args:
-            view_features: Backbone çıkışları.
+            view_features: Backbone çıkışları (spatial).
                 {
-                    "RCC":  (B, dim),
-                    "LCC":  (B, dim),
-                    "RMLO": (B, dim),
-                    "LMLO": (B, dim),
+                    "RCC":  (B, S, dim),
+                    "LCC":  (B, S, dim),
+                    "RMLO": (B, S, dim),
+                    "LMLO": (B, S, dim),
                 }
 
         Returns:
@@ -258,13 +310,13 @@ class BilateralLateralFusion(nn.Module):
                     "left":  (B, dim) — Sol meme lateral özniteliği.
                 }
         """
-        # Sağ meme: RCC + RMLO
+        # Sağ meme: RCC + RMLO → spatial cross-attention → pooled vektör
         right_lateral = self.lateral_fusion(
             cc_feat=view_features["RCC"],
             mlo_feat=view_features["RMLO"],
         )
 
-        # Sol meme: LCC + LMLO
+        # Sol meme: LCC + LMLO → spatial cross-attention → pooled vektör
         left_lateral = self.lateral_fusion(
             cc_feat=view_features["LCC"],
             mlo_feat=view_features["LMLO"],

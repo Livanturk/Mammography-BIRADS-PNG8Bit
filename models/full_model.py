@@ -4,31 +4,31 @@ Tam Model: Multi-View Hierarchical BI-RADS Classifier
 4 seviyeyi birleştiren ana model sınıfı.
 
 Model Akışı:
-    ┌─────────────────────────────────────────────────────┐
-    │  Girdi: 4 Görüntü (RCC, LCC, RMLO, LMLO)          │
-    │                                                      │
-    │  Seviye 1 — Backbone (Weight-Shared)                │
-    │  ├── RCC  → f_rcc   (512-dim)                       │
-    │  ├── LCC  → f_lcc   (512-dim)                       │
-    │  ├── RMLO → f_rmlo  (512-dim)                       │
-    │  └── LMLO → f_lmlo  (512-dim)                       │
-    │                                                      │
-    │  Seviye 2 — Lateral Cross-Attention                  │
-    │  ├── Right: CrossAttn(RCC, RMLO) → f_right (512-d)  │
-    │  └── Left:  CrossAttn(LCC, LMLO) → f_left  (512-d)  │
-    │                                                      │
-    │  Seviye 3 — Bilateral Fusion                         │
-    │  ├── f_diff = f_left - f_right                       │
-    │  ├── f_avg  = (f_left + f_right) / 2                 │
-    │  └── SelfAttn([f_L, f_R, f_diff, f_avg]) → f_pat    │
-    │                                                      │
-    │  Seviye 4 — Multi-Head Classification                │
-    │  ├── Binary:  f_pat → Benign/Malign                  │
-    │  ├── Benign:  f_pat → BIRADS 1/2                     │
-    │  ├── Malign:  f_pat → BIRADS 4/5                     │
-    │  └── Full:    f_pat → BIRADS 1/2/4/5                 │
-    │  └── Uncertainty: Temperature-scaled confidence      │
-    └─────────────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────┐
+    │  Girdi: 4 Görüntü (RCC, LCC, RMLO, LMLO)                  │
+    │                                                              │
+    │  Seviye 1 — Backbone (Weight-Shared, Spatial)               │
+    │  ├── RCC  → (B, S, dim)   S = H×W spatial token            │
+    │  ├── LCC  → (B, S, dim)                                     │
+    │  ├── RMLO → (B, S, dim)                                     │
+    │  └── LMLO → (B, S, dim)                                     │
+    │                                                              │
+    │  Seviye 2 — Lateral Spatial Cross-Attention                  │
+    │  ├── Right: CrossAttn(RCC↔RMLO) → pool → f_right (dim)     │
+    │  └── Left:  CrossAttn(LCC↔LMLO) → pool → f_left  (dim)     │
+    │                                                              │
+    │  Seviye 3 — Bilateral Fusion                                 │
+    │  ├── f_diff = f_left - f_right                               │
+    │  ├── f_avg  = (f_left + f_right) / 2                         │
+    │  └── SelfAttn([f_L, f_R, f_diff, f_avg]) → f_pat            │
+    │                                                              │
+    │  Seviye 4 — Multi-Head Classification                        │
+    │  ├── Binary:  f_pat → Benign/Malign                          │
+    │  ├── Benign:  f_pat → BIRADS 1/2                             │
+    │  ├── Malign:  f_pat → BIRADS 4/5                             │
+    │  └── Full:    f_pat → BIRADS 1/2/4/5                         │
+    │  └── Uncertainty: Temperature-scaled confidence              │
+    └─────────────────────────────────────────────────────────────┘
 
 Ablation Desteği:
     Config'deki ablation ayarlarına göre modüller devre dışı bırakılabilir.
@@ -59,9 +59,11 @@ class MammographyClassifier(nn.Module):
         super().__init__()
 
         model_cfg = config["model"]
+        data_cfg = config.get("data", {})
         ablation_cfg = config.get("ablation", {})
 
         self.projection_dim = model_cfg["projection_dim"]
+        image_size = data_cfg.get("image_size", 384)
 
         # Ablation bayrakları
         self.use_lateral = ablation_cfg.get("use_lateral_fusion", True)
@@ -71,7 +73,7 @@ class MammographyClassifier(nn.Module):
         self.use_uncertainty = ablation_cfg.get("use_uncertainty", True)
 
         # ============================================================
-        # Seviye 1: Backbone (her zaman aktif)
+        # Seviye 1: Backbone (her zaman aktif, spatial çıkış)
         # ============================================================
         backbone_cfg = model_cfg["backbone"]
         self.backbone = MultiViewBackbone(
@@ -80,7 +82,10 @@ class MammographyClassifier(nn.Module):
             projection_dim=self.projection_dim,
             freeze_layers=backbone_cfg.get("freeze_layers", 0),
             projection_dropout=backbone_cfg.get("projection_dropout", 0.2),
+            image_size=image_size,
         )
+
+        num_spatial_tokens = self.backbone.num_spatial_tokens
 
         # ============================================================
         # Seviye 2: Lateral Fusion (opsiyonel)
@@ -89,6 +94,7 @@ class MammographyClassifier(nn.Module):
             lat_cfg = model_cfg["lateral_fusion"]
             self.lateral_fusion = BilateralLateralFusion(
                 dim=self.projection_dim,
+                num_spatial_tokens=num_spatial_tokens,
                 num_heads=lat_cfg["num_heads"],
                 attention_dropout=lat_cfg.get("attention_dropout", 0.15),
                 ffn_dropout=lat_cfg.get("ffn_dropout", 0.2),
@@ -96,7 +102,7 @@ class MammographyClassifier(nn.Module):
                 num_layers=lat_cfg.get("num_layers", 2),
             )
         else:
-            # Lateral fusion yoksa: CC ve MLO'yu basitçe topla
+            # Lateral fusion yoksa: spatial token'ları pool et, CC ve MLO'yu basitçe birleştir
             self.simple_lateral_proj = nn.Sequential(
                 nn.Linear(self.projection_dim * 2, self.projection_dim),
                 nn.LayerNorm(self.projection_dim),
@@ -142,13 +148,14 @@ class MammographyClassifier(nn.Module):
         print(f"[MODEL] Eğitilebilir parametre: {trainable_params:,}")
         print(f"[MODEL] Lateral fusion: {'AÇIK' if self.use_lateral else 'KAPALI'}")
         print(f"[MODEL] Bilateral fusion: {'AÇIK' if self.use_bilateral else 'KAPALI'}")
+        print(f"[MODEL] Spatial token sayısı: {num_spatial_tokens}")
 
     def forward(self, images: torch.Tensor) -> dict:
         """
         Tam ileri geçiş (forward pass).
 
         Args:
-            images: (B, 4, 3, 384, 384) — 4 mammografi görüntüsü.
+            images: (B, 4, 3, H, W) — 4 mammografi görüntüsü.
 
         Returns:
             dict: Sınıflandırma sonuçları.
@@ -159,22 +166,24 @@ class MammographyClassifier(nn.Module):
                 - "confidence": (B,)
                 - "patient_features": (B, projection_dim) — Grad-CAM için
         """
-        # --- Seviye 1: Her görüntüden öznitelik çıkar ---
+        # --- Seviye 1: Her görüntüden spatial öznitelik çıkar ---
         view_features = self.backbone(images)
-        # view_features = {"RCC": (B, dim), "LCC": ..., "RMLO": ..., "LMLO": ...}
+        # view_features = {"RCC": (B, S, dim), "LCC": ..., "RMLO": ..., "LMLO": ...}
 
         # --- Seviye 2: Lateral Fusion ---
         if self.use_lateral:
+            # Spatial cross-attention + attention pooling → (B, dim) per side
             lateral_features = self.lateral_fusion(view_features)
             # {"right": (B, dim), "left": (B, dim)}
         else:
-            # Basit birleştirme: concat + projection
-            right_concat = torch.cat(
-                [view_features["RCC"], view_features["RMLO"]], dim=-1
-            )
-            left_concat = torch.cat(
-                [view_features["LCC"], view_features["LMLO"]], dim=-1
-            )
+            # Basit birleştirme: spatial pool → concat → projection
+            right_pooled = view_features["RCC"].mean(dim=1)     # (B, dim)
+            rmlo_pooled = view_features["RMLO"].mean(dim=1)     # (B, dim)
+            left_pooled = view_features["LCC"].mean(dim=1)      # (B, dim)
+            lmlo_pooled = view_features["LMLO"].mean(dim=1)     # (B, dim)
+
+            right_concat = torch.cat([right_pooled, rmlo_pooled], dim=-1)
+            left_concat = torch.cat([left_pooled, lmlo_pooled], dim=-1)
             lateral_features = {
                 "right": self.simple_lateral_proj(right_concat),
                 "left": self.simple_lateral_proj(left_concat),

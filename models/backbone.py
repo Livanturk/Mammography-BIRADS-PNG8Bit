@@ -2,17 +2,24 @@
 Seviye 1: Image-Level Feature Extraction (Backbone)
 =====================================================
 Weight-shared backbone ağı ile her mammografi görüntüsünden
-öznitelik vektörü (feature vector) çıkarır.
+spatial öznitelik haritası (feature map) çıkarır.
 
 Weight Sharing Nedir?
     4 farklı görüntü (RCC, LCC, RMLO, LMLO) aynı backbone ağından geçirilir.
     Böylece tüm görüntüler aynı öznitelik uzayında (feature space) temsil edilir
     ve parametre sayısı 4 kat azaltılmış olur.
 
+Spatial Feature Map:
+    Global Average Pooling YAPILMAZ. Backbone çıkışı (B, C, H, W) olarak korunur
+    ve (B, H*W, projection_dim) şeklinde spatial token dizisine dönüştürülür.
+    Bu sayede Lateral Fusion'da gerçek cross-attention uygulanabilir:
+    CC'deki her spatial bölge, MLO'daki ilgili bölgelere dikkat edebilir.
+
 Desteklenen Backbone'lar:
     - ResNet50: Klasik, güvenilir. Feature dim = 2048.
     - EfficientNet-B0/B3/B5: Hafif ve etkili. Feature dim = 1280/1536/2048.
-    - ConvNeXt-Tiny/Small: Modern CNN. Feature dim = 768/768.
+    - ConvNeXt-Tiny/Small/Large: Modern CNN. Feature dim = 768/768/1536.
+    - MaxViT: Hibrit ViT+CNN. Feature dim = 768.
 """
 
 from typing import Optional
@@ -24,42 +31,63 @@ import timm
 
 class BackboneFeatureExtractor(nn.Module):
     """
-    Pretrained backbone + projeksiyon katmanı.
+    Pretrained backbone + spatial projeksiyon katmanı.
 
     Akış:
-        Görüntü (3, 384, 384) → Backbone → Global Avg Pool → Projection → Feature (projection_dim,)
+        Görüntü (3, 384, 384)
+            → Backbone (global pool yok)
+            → Spatial Feature Map (B, C, H, W)
+            → Reshape (B, H*W, C)
+            → Projection (B, H*W, projection_dim)
 
     Args:
         backbone_name: timm kütüphanesinden model adı.
         pretrained: ImageNet ağırlıklarını kullan.
         projection_dim: Çıkış öznitelik boyutu.
         freeze_layers: İlk N katmanı dondur (fine-tuning stratejisi).
+        projection_dropout: Projeksiyon katmanı dropout oranı.
+        image_size: Girdi görüntü boyutu (spatial token sayısını hesaplamak için).
     """
 
     def __init__(
         self,
-        backbone_name: str = "efficientnet_b3",
+        backbone_name: str = "convnext_large",
         pretrained: bool = True,
         projection_dim: int = 512,
         freeze_layers: int = 0,
         projection_dropout: float = 0.2,
+        image_size: int = 384,
     ):
         super().__init__()
 
-        # timm ile backbone oluştur (son sınıflandırma katmanı olmadan)
+        # timm ile backbone oluştur — global pooling YOK, spatial feature map korunur
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
-            num_classes=0,      # Sınıflandırma kafasını kaldır
-            global_pool="avg",  # Global Average Pooling
+            num_classes=0,
+            global_pool="",     # Spatial feature map koru (global avg pool yapma)
         )
 
         # Backbone'un çıkış boyutunu öğren
-        # timm modelleri num_features attribute'unu sağlar
         backbone_dim = self.backbone.num_features
 
-        # Projeksiyon katmanı: backbone_dim → projection_dim
-        # Bu katman, farklı backbone'ların çıkışlarını ortak bir boyuta indirger
+        # Spatial token sayısını hesapla (dummy forward ile)
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size)
+            dummy_out = self.backbone(dummy)
+            if dummy_out.dim() == 4:
+                if dummy_out.shape[1] == backbone_dim:
+                    # Channels-first: (1, C, H, W) — CNN (ConvNeXt, ResNet, EfficientNet)
+                    self.num_spatial_tokens = dummy_out.shape[2] * dummy_out.shape[3]
+                else:
+                    # Channels-last: (1, H, W, C) — Swin Transformer vb.
+                    self.num_spatial_tokens = dummy_out.shape[1] * dummy_out.shape[2]
+            else:
+                # ViT çıkışı: (1, N, C)
+                self.num_spatial_tokens = dummy_out.shape[1]
+
+        # Projeksiyon katmanı: backbone_dim → projection_dim (her spatial token için)
+        # nn.Linear son boyut üzerinde çalışır, (B, S, backbone_dim) → (B, S, projection_dim)
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, projection_dim),
             nn.LayerNorm(projection_dim),
@@ -74,6 +102,9 @@ class BackboneFeatureExtractor(nn.Module):
         self.backbone_dim = backbone_dim
         self.projection_dim = projection_dim
 
+        print(f"[BACKBONE] {backbone_name}: {backbone_dim}-dim → {projection_dim}-dim projeksiyon")
+        print(f"[BACKBONE] Spatial token sayısı: {self.num_spatial_tokens}")
+
     def _freeze_layers(self, n: int):
         """
         Backbone'un ilk N katmanını dondurur (gradyan hesaplanmaz).
@@ -87,14 +118,29 @@ class BackboneFeatureExtractor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Spatial öznitelik haritası çıkarır.
+
         Args:
             x: (B, 3, H, W) boyutunda görüntü tensörü.
 
         Returns:
-            (B, projection_dim) boyutunda öznitelik vektörü.
+            (B, num_spatial_tokens, projection_dim) boyutunda spatial öznitelik dizisi.
         """
-        features = self.backbone(x)     # (B, backbone_dim)
-        projected = self.projection(features)  # (B, projection_dim)
+        features = self.backbone(x)
+
+        if features.dim() == 4:
+            if features.shape[1] == self.backbone_dim:
+                # Channels-first: (B, C, H, W) — CNN (ConvNeXt, ResNet, EfficientNet)
+                B, C, H, W = features.shape
+                features = features.permute(0, 2, 3, 1).reshape(B, H * W, C)
+            else:
+                # Channels-last: (B, H, W, C) — Swin Transformer vb.
+                B, H, W, C = features.shape
+                features = features.reshape(B, H * W, C)
+        # 3D çıkış (B, N, C) zaten doğru formatta — ViT modelleri
+
+        # Her spatial token için projeksiyon
+        projected = self.projection(features)   # (B, S, projection_dim)
         return projected
 
     def get_last_conv_layer(self) -> nn.Module:
@@ -102,7 +148,6 @@ class BackboneFeatureExtractor(nn.Module):
         Grad-CAM için backbone'un son konvolüsyon katmanını döndürür.
         timm modellerinin yapısına göre doğru katmanı bulur.
         """
-        # Yaygın timm mimarileri için son konvolüsyon katmanı
         if hasattr(self.backbone, "conv_head"):
             # EfficientNet ailesi
             return self.backbone.conv_head
@@ -127,10 +172,10 @@ class BackboneFeatureExtractor(nn.Module):
 class MultiViewBackbone(nn.Module):
     """
     4 mammografi görüntüsünü tek bir weight-shared backbone'dan geçirir.
+    Her görüntü için spatial öznitelik dizisi döndürür.
 
     Weight Sharing:
         Aynı BackboneFeatureExtractor nesnesi 4 kez kullanılır.
-        Bu, parametrelerin paylaşılması anlamına gelir:
         - 4 ayrı backbone → ~4x parametre (kötü, overfitting riski)
         - 1 shared backbone → 1x parametre (verimli, genelleme iyi)
 
@@ -139,15 +184,18 @@ class MultiViewBackbone(nn.Module):
         pretrained: ImageNet pretrained ağırlıklar.
         projection_dim: Çıkış boyutu.
         freeze_layers: Dondurulacak katman sayısı.
+        projection_dropout: Projeksiyon dropout oranı.
+        image_size: Girdi görüntü boyutu.
     """
 
     def __init__(
         self,
-        backbone_name: str = "efficientnet_b3",
+        backbone_name: str = "convnext_large",
         pretrained: bool = True,
         projection_dim: int = 512,
         freeze_layers: int = 0,
         projection_dropout: float = 0.2,
+        image_size: int = 384,
     ):
         super().__init__()
 
@@ -158,25 +206,28 @@ class MultiViewBackbone(nn.Module):
             projection_dim=projection_dim,
             freeze_layers=freeze_layers,
             projection_dropout=projection_dropout,
+            image_size=image_size,
         )
+
+        self.num_spatial_tokens = self.backbone.num_spatial_tokens
 
     def forward(
         self, images: torch.Tensor
     ) -> dict:
         """
-        4 mammografi görüntüsünü işler.
+        4 mammografi görüntüsünü işler, spatial öznitelik dizileri döndürür.
 
         Args:
             images: (B, 4, C, H, W) boyutunda tensor.
                     Kanal sırası: [RCC, LCC, RMLO, LMLO]
 
         Returns:
-            dict: Her görüntünün öznitelik vektörü.
+            dict: Her görüntünün spatial öznitelik dizisi.
                 {
-                    "RCC":  (B, projection_dim),
-                    "LCC":  (B, projection_dim),
-                    "RMLO": (B, projection_dim),
-                    "LMLO": (B, projection_dim),
+                    "RCC":  (B, num_spatial_tokens, projection_dim),
+                    "LCC":  (B, num_spatial_tokens, projection_dim),
+                    "RMLO": (B, num_spatial_tokens, projection_dim),
+                    "LMLO": (B, num_spatial_tokens, projection_dim),
                 }
         """
         B, num_views, C, H, W = images.shape
@@ -186,8 +237,7 @@ class MultiViewBackbone(nn.Module):
         view_names = ["RCC", "LCC", "RMLO", "LMLO"]
 
         for i, name in enumerate(view_names):
-            # Her görüntüyü ayrı ayrı backbone'dan geçir
-            view_img = images[:, i]          # (B, C, H, W)
-            features[name] = self.backbone(view_img)  # (B, projection_dim)
+            view_img = images[:, i]                     # (B, C, H, W)
+            features[name] = self.backbone(view_img)    # (B, S, projection_dim)
 
         return features

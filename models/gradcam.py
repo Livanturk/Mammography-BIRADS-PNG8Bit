@@ -150,6 +150,24 @@ class GradCAM:
         self.cleanup()
 
 
+class _GradCAMBackboneWrapper(nn.Module):
+    """
+    Backbone'un spatial çıkışını GradCAM için pool'layan wrapper.
+
+    Backbone artık (B, S, dim) spatial token dizisi döndürüyor.
+    GradCAM ise (B, dim) boyutunda bir çıkış bekliyor (gradyan hesabı için).
+    Bu wrapper spatial token'ları average pool ile tek vektöre indirger.
+    """
+
+    def __init__(self, backbone_extractor):
+        super().__init__()
+        self.backbone = backbone_extractor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        spatial = self.backbone(x)          # (B, S, dim)
+        return spatial.mean(dim=1)          # (B, dim)
+
+
 def generate_gradcam_for_patient(
     model: nn.Module,
     images: torch.Tensor,
@@ -176,12 +194,14 @@ def generate_gradcam_for_patient(
         backbone_extractor = model.get_backbone_extractor()
         target_layer = backbone_extractor.get_last_conv_layer()
 
+    # Backbone artık spatial çıkış veriyor (B, S, dim).
+    # GradCAM için spatial token'ları pool'layan bir wrapper kullanıyoruz.
+    backbone_wrapper = _GradCAMBackboneWrapper(model.backbone.backbone)
+    backbone_wrapper.eval()
+
     heatmaps = {}
     for i, name in enumerate(view_names):
-        single_view = images[:, i:i+1]  # (1, 1, 3, H, W)
-        # Not: Bu basitleştirilmiş bir yaklaşımdır.
-        # Tam modelden geçirmek yerine backbone'u ayrıca kullanıyoruz.
-        gradcam = GradCAM(model.backbone.backbone, target_layer)
+        gradcam = GradCAM(backbone_wrapper, target_layer)
         single_img = images[0, i].unsqueeze(0)  # (1, 3, H, W)
         heatmap = gradcam.generate(single_img, target_class)
         heatmaps[name] = heatmap
