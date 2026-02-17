@@ -1,0 +1,187 @@
+# =============================================================================
+# Multi-View Mammography BI-RADS Classification - Configuration
+# =============================================================================
+# Bu dosya projenin tüm ayarlarını merkezi olarak yönetir.
+# Yeni bir deney başlatmak için bu dosyayı düzenleyin veya
+# komut satırından override edin: python train.py --config config.yaml
+# =============================================================================
+
+# --- Proje Meta Bilgileri ---
+project:
+  name: "mammography-birads-classification"
+  description: "Multi-view hierarchical fusion for BI-RADS classification"
+  seed: 42
+
+# --- Veri Seti Ayarları ---
+data:
+  root_dir: "PNG-8Bit"          # Train/Val BI-RADS klasörlerinin bulunduğu kök dizin
+  test_dir: "PNG-8Bit-test"     # Sabit test seti klasörü (aynı BI-RADS alt yapısı)
+  image_size: 384                        # Görüntü boyutu (384x384)
+  num_workers: 4                         # DataLoader worker sayısı
+  pin_memory: true                       # GPU transfer hızlandırması
+
+  # Veri seti klasör yapısı (etiketler klasör adından otomatik okunur):
+  # root_dir/
+  #   BI-RADS1/
+  #     patient_001/
+  #       RCC.png
+  #       LCC.png
+  #       RMLO.png
+  #       LMLO.png
+  #     patient_002/
+  #       ...
+  #   BI-RADS2/
+  #     ...
+  #   BI-RADS4/
+  #     ...
+  #   BI-RADS5/
+  #     ...
+
+  # Veri bölme oranları (hasta bazlı stratified split, sadece train/val)
+  split:
+    train: 0.85
+    val: 0.15
+
+  # Veri artırma (augmentation) ayarları
+  augmentation:
+    enabled: true
+    horizontal_flip: 0.5               # Yatay çevirme olasılığı
+    vertical_flip: 0.0                  # Mamografide dikey çevirme genelde kullanılmaz
+    rotation_degrees: 10                # Rastgele döndürme açısı
+    brightness: 0.1                     # Parlaklık değişimi
+    contrast: 0.1                       # Kontrast değişimi
+    random_erasing: 0.1                 # Random erasing olasılığı
+
+# --- Model Mimarisi ---
+model:
+  # Seviye 1: Backbone seçimi
+  backbone:
+    name: "convnext_large.fb_in22k_ft_in1k_384"  # Seçenekler: resnet50, efficientnet_b0/b3/b5, convnext_tiny/small/large, maxvit_base_tf_384.in1k
+    pretrained: true                    # ImageNet pre-trained ağırlıklar
+    freeze_layers: 0                    # İlk N katmanı dondur (0 = hepsi eğitilebilir)
+    feature_dim: 1536                  # Backbone çıkış boyutu (backbone'a göre değişir)
+                                        # resnet50: 2048, efficientnet_b0: 1280,
+                                        # efficientnet_b3: 1536, convnext_large: 1536,
+                                        # convnext_tiny: 768, maxvit_base: 768
+    projection_dropout: 0.2             # Backbone→projection katmanı dropout
+
+  # Ortak projeksiyon boyutu (tüm seviyeler bu boyutu kullanır)
+  projection_dim: 512
+
+  # Seviye 2: Lateral Spatial Cross-Attention
+  lateral_fusion:
+    num_heads: 8                        # Multi-head attention başlık sayısı
+    attention_dropout: 0.15             # Cross-attention dropout
+    ffn_dropout: 0.2                    # Feed-forward network dropout
+    projection_dropout: 0.2             # Fusion projection dropout
+    num_layers: 2                       # Cross-attention katman sayısı
+
+  # Seviye 3: Bilateral Fusion
+  bilateral_fusion:
+    num_heads: 8
+    attention_dropout: 0.2              # Self-attention ve FFN dropout
+    output_dropout: 0.25                # Son projeksiyon dropout
+    use_diff: true                      # F_diff = F_left - F_right
+    use_avg: true                       # F_avg = (F_left + F_right) / 2
+
+  # Seviye 4: Classification Heads
+  classification:
+    num_classes: 4                      # BI-RADS 1, 2, 4, 5
+    hidden_dim: 256                     # Head'lerdeki gizli katman boyutu
+    dropout: 0.5                        # Classification dropout
+    temperature: 1.5                    # Uncertainty estimation temperature scaling
+
+# --- Eğitim Ayarları ---
+training:
+  epochs: 100
+  batch_size: 4                         # Hasta sayısı (her hasta 4 görüntü)
+  gradient_accumulation_steps: 16        # Efektif batch = batch_size * grad_accum
+
+  # Optimizer (layer-wise weight decay)
+  optimizer:
+    name: "adamw"                       # Seçenekler: adam, adamw, sgd
+    lr: 5.0e-5                          # Öğrenme oranı (fusion + head katmanları)
+    backbone_lr_scale: 0.2             # Backbone LR çarpanı (lr * 0.1 = 5e-6)
+    weight_decay:                       # Layer-wise weight decay
+      backbone: 0.05                     # Pretrained: yüksek — orijinalden uzaklaşmayı sınırlar
+      fusion: 0.05                      # Yeni katmanlar: orta
+      head: 0.01                        # Karar katmanı: düşük — dropout yeterli regularization sağlar
+    betas: [0.9, 0.999]                 # Adam/AdamW beta değerleri
+
+  # Learning Rate Scheduler
+  scheduler:
+    name: "onecycle"               # Seçenekler: cosine_warmup, cosine_warm_restarts, onecycle, step, plateau
+    # --- cosine_warmup ---
+    warmup_epochs: 8                    # Warmup epoch sayısı
+    min_lr: 1.0e-6                      # Minimum öğrenme oranı
+    # --- cosine_warm_restarts (SGDR) ---
+    T_0: 20                             # İlk restart periyodu (epoch)
+    T_mult: 2                           # Periyot çarpanı (20→40→80 epoch)
+    eta_min: 1.0e-7                     # Minimum LR
+    # --- onecycle ---
+    max_lr: 5.0e-4                      # Peak LR (backbone: max_lr × backbone_lr_scale)
+    pct_start: 0.3                      # Warmup oranı (%30 = 30 epoch)
+    div_factor: 10.0                    # Başlangıç LR = max_lr / div_factor
+    final_div_factor: 100.0             # Son LR = başlangıç_lr / final_div_factor
+    anneal_strategy: "cos"              # "cos" veya "linear"
+    # --- step ---
+    step_size: 30
+    gamma: 0.1
+
+  # Multi-Head Loss Ağırlıkları
+  loss_weights:
+    binary_head: 0.15                    # Benign vs Malign ağırlığı
+    subgroup_head: 0.35                  # 1vs2 ve 4vs5 ağırlığı
+    full_head: 0.50                      # 4-sınıf ağırlığı
+
+  # Sınıf dengesizliği için ağırlıklar (sqrt-inverse frequency)
+  # w_i = sqrt(N_max / N_i), N_max=2504 (BI-RADS 2)
+  class_weights: [1.32, 1.0, 1.23, 1.13]   # BI-RADS [1, 2, 4, 5] sırasıyla
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 15                        # Kaç epoch iyileşme olmazsa dur
+    metric: "val_full_f1_macro"         # İzlenecek metrik
+    mode: "max"                         # "max" veya "min"
+
+# --- Ablation Study Konfigürasyonu ---
+# Bu bölüm hangi modüllerin aktif olduğunu kontrol eder.
+# Baseline deney için sadece backbone + full_head aktif bırakılır.
+ablation:
+  use_lateral_fusion: true              # Seviye 2'yi aktif et
+  use_bilateral_fusion: true            # Seviye 3'ü aktif et
+  use_binary_head: true                 # Binary head aktif
+  use_subgroup_head: true               # Subgroup head aktif
+  use_uncertainty: true                 # Uncertainty estimation aktif
+
+# --- MLFlow / DagsHub Ayarları ---
+mlflow:
+  tracking_uri: "https://dagshub.com/alilivanturk/Mammography-BIRADS-PNG8Bit.mlflow"
+  experiment_name: "birads-classification"
+  dagshub_username: "alilivanturk"
+  dagshub_token: "d176ee2b4802fb2eb5e703cde1065dec251804e1"                     # Boş bırakılırsa env variable'dan okur
+  log_every_n_steps: 50                 # Her N step'te metrik logla
+
+# --- Weights & Biases Ayarları ---
+wandb:
+  project: "mammography-birads-classification"
+  entity: ""                              # WandB kullanıcı/takım adı (boş = varsayılan hesap)
+
+# --- Grad-CAM ve Görselleştirme ---
+visualization:
+  gradcam:
+    enabled: true
+    target_layer: "auto"                # "auto" = backbone'un son conv katmanı
+    num_samples: 20                     # Test setinden kaç örnek görselleştirilecek
+    save_dir: "outputs/gradcam"
+  confusion_matrix:
+    save_dir: "outputs/plots"
+  classification_report:
+    save_dir: "outputs/reports"
+
+# --- Checkpoint Ayarları ---
+checkpoint:
+  save_dir: "outputs/checkpoints"
+  save_top_k: 3                         # En iyi K modeli sakla
+  save_last: true                       # Son modeli her zaman sakla
