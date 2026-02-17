@@ -229,8 +229,14 @@ def build_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
         raise ValueError(f"Desteklenmeyen optimizer: {name}")
 
 
-def build_scheduler(optimizer, config: dict):
-    """Config'e göre learning rate scheduler oluşturur."""
+def build_scheduler(optimizer, config: dict, steps_per_epoch: int = None):
+    """Config'e göre learning rate scheduler oluşturur.
+
+    Args:
+        optimizer: Optimizer instance.
+        config: Tam config dict.
+        steps_per_epoch: Epoch başına batch sayısı (OneCycleLR için gerekli).
+    """
     sched_cfg = config["training"]["scheduler"]
     name = sched_cfg["name"].lower()
     epochs = config["training"]["epochs"]
@@ -239,9 +245,6 @@ def build_scheduler(optimizer, config: dict):
         warmup_epochs = sched_cfg.get("warmup_epochs", 5)
         min_lr = sched_cfg.get("min_lr", 1e-6)
 
-        # Warmup + Cosine Annealing
-        # İlk warmup_epochs: LR lineer olarak artar
-        # Sonra: Cosine eğrisi ile azalır
         def warmup_cosine_fn(epoch):
             if epoch < warmup_epochs:
                 return epoch / warmup_epochs
@@ -253,6 +256,46 @@ def build_scheduler(optimizer, config: dict):
                 )
 
         return torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_fn)
+
+    elif name == "cosine_warm_restarts":
+        T_0 = sched_cfg.get("T_0", 20)
+        T_mult = sched_cfg.get("T_mult", 2)
+        eta_min = sched_cfg.get("eta_min", 1e-7)
+
+        return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=T_0, T_mult=T_mult, eta_min=eta_min,
+        )
+
+    elif name == "onecycle":
+        assert steps_per_epoch is not None, \
+            "OneCycleLR için steps_per_epoch gerekli"
+
+        max_lr = sched_cfg.get("max_lr", 5e-4)
+        backbone_lr_scale = config["training"]["optimizer"].get("backbone_lr_scale", 0.2)
+
+        # Her param grup için max_lr: backbone grupları scaled, diğerleri tam
+        max_lrs = []
+        for group in optimizer.param_groups:
+            group_name = group.get("group_name", "")
+            if "backbone" in group_name:
+                max_lrs.append(max_lr * backbone_lr_scale)
+            else:
+                max_lrs.append(max_lr)
+
+        # Efektif optimizer step sayısı (gradient accumulation dahil)
+        grad_accum = config["training"].get("gradient_accumulation_steps", 1)
+        effective_steps = (steps_per_epoch + grad_accum - 1) // grad_accum
+
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lrs,
+            epochs=epochs,
+            steps_per_epoch=effective_steps,
+            pct_start=sched_cfg.get("pct_start", 0.3),
+            anneal_strategy=sched_cfg.get("anneal_strategy", "cos"),
+            div_factor=sched_cfg.get("div_factor", 10.0),
+            final_div_factor=sched_cfg.get("final_div_factor", 100.0),
+        )
 
     elif name == "step":
         return torch.optim.lr_scheduler.StepLR(
@@ -320,6 +363,7 @@ def train_one_epoch(
     scaler: GradScaler,
     config: dict,
     tracker: MetricTracker,
+    scheduler=None,
 ) -> dict:
     """
     Bir epoch eğitim döngüsü.
@@ -358,6 +402,10 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+
+            # Step-level scheduler (OneCycleLR)
+            if scheduler is not None:
+                scheduler.step()
 
         # Metrikleri birikdir
         tracker.update(outputs, labels, loss_dict)
@@ -450,7 +498,7 @@ def main(config_path: str, baseline: bool = False, device_id: int = 0):
     print("\n[3/5] Eğitim bileşenleri hazırlanıyor...")
     criterion = build_loss_function(config, device)
     optimizer = build_optimizer(model, config)
-    scheduler = build_scheduler(optimizer, config)
+    scheduler = build_scheduler(optimizer, config, steps_per_epoch=len(dataloaders["train"]))
     scaler = GradScaler()  # Mixed precision
 
     # Early stopping
@@ -487,10 +535,14 @@ def main(config_path: str, baseline: bool = False, device_id: int = 0):
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
 
+        # OneCycleLR step-level çalışır, diğerleri epoch-level
+        is_step_scheduler = isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR)
+
         # Eğitim
         train_metrics = train_one_epoch(
             model, dataloaders["train"], criterion, optimizer,
             device, scaler, config, train_tracker,
+            scheduler=scheduler if is_step_scheduler else None,
         )
 
         # Doğrulama
@@ -498,11 +550,12 @@ def main(config_path: str, baseline: bool = False, device_id: int = 0):
             model, dataloaders["val"], criterion, device, val_tracker,
         )
 
-        # Scheduler step
-        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(val_metrics.get("full_f1_macro", 0))
-        else:
-            scheduler.step()
+        # Epoch-level scheduler step (OneCycleLR hariç — o train_one_epoch içinde step eder)
+        if not is_step_scheduler:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_metrics.get("full_f1_macro", 0))
+            else:
+                scheduler.step()
 
         # Metrikleri logla
         current_lr = optimizer.param_groups[0]["lr"]

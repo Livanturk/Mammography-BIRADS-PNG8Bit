@@ -39,6 +39,8 @@ class MultiHeadLoss(nn.Module):
             {"binary_head": 0.3, "subgroup_head": 0.3, "full_head": 0.4}
         class_weights_4: 4-sınıf için sınıf ağırlıkları (tensor).
         class_weights_binary: Binary için sınıf ağırlıkları (tensor).
+        class_weights_benign_sub: Benign subgroup (BIRADS 1 vs 2) ağırlıkları.
+        class_weights_malign_sub: Malign subgroup (BIRADS 4 vs 5) ağırlıkları.
         use_binary: Binary head kaybını hesapla.
         use_subgroup: Subgroup head kaybını hesapla.
         label_smoothing: Etiket yumuşatma (overfitting'i azaltır).
@@ -49,6 +51,8 @@ class MultiHeadLoss(nn.Module):
         loss_weights: dict,
         class_weights_4: Optional[torch.Tensor] = None,
         class_weights_binary: Optional[torch.Tensor] = None,
+        class_weights_benign_sub: Optional[torch.Tensor] = None,
+        class_weights_malign_sub: Optional[torch.Tensor] = None,
         use_binary: bool = True,
         use_subgroup: bool = True,
         label_smoothing: float = 0.05,
@@ -73,8 +77,13 @@ class MultiHeadLoss(nn.Module):
             label_smoothing=label_smoothing,
         )
 
-        # Subgroup CrossEntropy (ağırlıksız — zaten filtrelenmiş örnekler)
-        self.subgroup_criterion = nn.CrossEntropyLoss(
+        # Subgroup CrossEntropy — her alt grup için ayrı ağırlıklar
+        self.benign_sub_criterion = nn.CrossEntropyLoss(
+            weight=class_weights_benign_sub,
+            label_smoothing=label_smoothing,
+        )
+        self.malign_sub_criterion = nn.CrossEntropyLoss(
+            weight=class_weights_malign_sub,
             label_smoothing=label_smoothing,
         )
 
@@ -126,14 +135,14 @@ class MultiHeadLoss(nn.Module):
             if benign_mask.any():
                 benign_logits = outputs["benign_sub_logits"][benign_mask]
                 benign_labels = label_dict["benign_sub"]
-                benign_sub_loss = self.subgroup_criterion(benign_logits, benign_labels)
+                benign_sub_loss = self.benign_sub_criterion(benign_logits, benign_labels)
 
             # Malign alt grubu (BIRADS 4 ve 5 olan örnekler)
             malign_mask = label_dict["malign_mask"]
             if malign_mask.any():
                 malign_logits = outputs["malign_sub_logits"][malign_mask]
                 malign_labels = label_dict["malign_sub"]
-                malign_sub_loss = self.subgroup_criterion(malign_logits, malign_labels)
+                malign_sub_loss = self.malign_sub_criterion(malign_logits, malign_labels)
 
             subgroup_loss = (benign_sub_loss + malign_sub_loss) / 2.0
             losses["benign_sub_loss"] = benign_sub_loss
@@ -163,13 +172,21 @@ def build_loss_function(config: dict, device: torch.device) -> MultiHeadLoss:
     class_weights_4 = torch.tensor(cw, dtype=torch.float32).to(device)
 
     # Binary ağırlıklar (benign örnek sayısı vs malign)
-    # BIRADS 1+2 = 4432, BIRADS 4+5 = 4172 → yaklaşık dengeli
-    class_weights_binary = torch.tensor([1.0, 1.06], dtype=torch.float32).to(device)
+    # BIRADS 1+2 = 3932, BIRADS 4+5 = 3625 → yaklaşık dengeli
+    class_weights_binary = torch.tensor([1.0, 1.08], dtype=torch.float32).to(device)
+
+    # Subgroup ağırlıkları (sqrt-inverse frequency)
+    # Benign: BIRADS 1 (1428) vs BIRADS 2 (2504) → sqrt(2504/1428)=1.32, 1.0
+    class_weights_benign_sub = torch.tensor([1.32, 1.0], dtype=torch.float32).to(device)
+    # Malign: BIRADS 4 (1648) vs BIRADS 5 (1977) → sqrt(1977/1648)=1.10, 1.0
+    class_weights_malign_sub = torch.tensor([1.10, 1.0], dtype=torch.float32).to(device)
 
     return MultiHeadLoss(
         loss_weights=train_cfg["loss_weights"],
         class_weights_4=class_weights_4,
         class_weights_binary=class_weights_binary,
+        class_weights_benign_sub=class_weights_benign_sub,
+        class_weights_malign_sub=class_weights_malign_sub,
         use_binary=ablation_cfg.get("use_binary_head", True),
         use_subgroup=ablation_cfg.get("use_subgroup_head", True),
     )
